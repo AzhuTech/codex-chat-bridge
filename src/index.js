@@ -311,7 +311,18 @@ class CodexClient {
     this.loadedThreads.add(threadId);
   }
 
+  async readThread(threadId, includeTurns = false) {
+    await this.connect();
+    const result = await this.request("thread/read", { threadId, includeTurns });
+    return result.thread;
+  }
+
   async sendTurn({ threadId, text, cwd, model, timeoutMs = 30 * 60 * 1000 }) {
+    const thread = await this.readThread(threadId, false);
+    if (thread.status?.type === "active") {
+      const flags = thread.status.activeFlags?.length ? ` (${thread.status.activeFlags.join(", ")})` : "";
+      throw new Error(`Codex session is busy${flags}. Try again after the current turn finishes, or send /new to use a separate session.`);
+    }
     await this.resumeThread(threadId, { cwd, model });
     const started = await this.request("turn/start", {
       threadId,
@@ -449,6 +460,7 @@ async function handleTelegramMessage({ telegram, codex, store, config, message }
       "Commands:",
       "/status - show binding",
       "/new - create a new Codex thread",
+      "If the bound Codex thread is busy, wait for it to finish or use /new.",
       "Any other message is sent to the bound Codex thread.",
     ].join("\n"));
     return;
