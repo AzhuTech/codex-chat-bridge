@@ -208,6 +208,8 @@ class CodexClient {
     this.pending = new Map();
     this.turns = new Map();
     this.loadedThreads = new Set();
+    this.threadStatuses = new Map();
+    this.statusWaiters = new Map();
   }
 
   async connect() {
@@ -245,6 +247,11 @@ class CodexClient {
     const params = msg.params || {};
     const turnId = params.turnId || params.turn?.id;
     const key = params.threadId && turnId ? `${params.threadId}:${turnId}` : null;
+    if (msg.method === "thread/status/changed" && params.threadId) {
+      this.threadStatuses.set(params.threadId, params.status);
+      this.resolveStatusWaiters(params.threadId);
+    }
+
     if (!key || !this.turns.has(key)) return;
     const turn = this.turns.get(key);
 
@@ -314,15 +321,48 @@ class CodexClient {
   async readThread(threadId, includeTurns = false) {
     await this.connect();
     const result = await this.request("thread/read", { threadId, includeTurns });
+    if (result.thread?.status) this.threadStatuses.set(threadId, result.thread.status);
     return result.thread;
   }
 
-  async sendTurn({ threadId, text, cwd, model, timeoutMs = 30 * 60 * 1000 }) {
-    const thread = await this.readThread(threadId, false);
-    if (thread.status?.type === "active") {
-      const flags = thread.status.activeFlags?.length ? ` (${thread.status.activeFlags.join(", ")})` : "";
-      throw new Error(`Codex session is busy${flags}. Try again after the current turn finishes, or send /new to use a separate session.`);
+  async waitForIdle(threadId, timeoutMs = 30 * 60 * 1000) {
+    const startedAt = Date.now();
+    while (true) {
+      const thread = await this.readThread(threadId, false);
+      if (thread.status?.type !== "active") return thread;
+      const remaining = timeoutMs - (Date.now() - startedAt);
+      if (remaining <= 0) {
+        const flags = thread.status.activeFlags?.length ? ` (${thread.status.activeFlags.join(", ")})` : "";
+        throw new Error(`Codex session stayed busy${flags} for ${Math.round(timeoutMs / 1000)}s.`);
+      }
+      await this.waitForStatusChangeOrDelay(threadId, remaining);
     }
+  }
+
+  waitForStatusChangeOrDelay(threadId, remainingMs) {
+    return new Promise((resolve) => {
+      const waiters = this.statusWaiters.get(threadId) || new Set();
+      const waiter = () => {
+        clearTimeout(timeout);
+        waiters.delete(waiter);
+        if (!waiters.size) this.statusWaiters.delete(threadId);
+        resolve();
+      };
+      const timeout = setTimeout(waiter, Math.min(remainingMs, 10_000));
+      waiters.add(waiter);
+      this.statusWaiters.set(threadId, waiters);
+    });
+  }
+
+  resolveStatusWaiters(threadId) {
+    const waiters = this.statusWaiters.get(threadId);
+    if (!waiters) return;
+    this.statusWaiters.delete(threadId);
+    for (const waiter of waiters) waiter();
+  }
+
+  async sendTurn({ threadId, text, cwd, model, timeoutMs = 30 * 60 * 1000 }) {
+    await this.waitForIdle(threadId, timeoutMs);
     await this.resumeThread(threadId, { cwd, model });
     const started = await this.request("turn/start", {
       threadId,
@@ -446,8 +486,9 @@ function chatAllowed(config, store, chatId) {
   return Boolean(store.getBinding("telegram", String(chatId)));
 }
 
-async function handleTelegramMessage({ telegram, codex, store, config, message }) {
+async function handleTelegramMessage({ telegram, codex, store, config, queue, message }) {
   const chatId = String(message.chat.id);
+  const chatKey = `telegram:${chatId}`;
   const text = (message.text || "").trim();
   if (!text) return;
 
@@ -460,7 +501,7 @@ async function handleTelegramMessage({ telegram, codex, store, config, message }
       "Commands:",
       "/status - show binding",
       "/new - create a new Codex thread",
-      "If the bound Codex thread is busy, wait for it to finish or use /new.",
+      "If the bound Codex thread is busy, messages from this chat are queued in order.",
       "Any other message is sent to the bound Codex thread.",
     ].join("\n"));
     return;
@@ -498,21 +539,27 @@ async function handleTelegramMessage({ telegram, codex, store, config, message }
     return;
   }
 
-  await telegram.sendMessage(chatId, "收到，我转给 Codex。");
-  await telegram.sendChatAction(chatId);
-  try {
-    const result = await codex.sendTurn({
-      threadId: binding.threadId,
-      text,
-      cwd: binding.cwd || config.codex.defaultCwd,
-      model: binding.model || config.codex.defaultModel,
-    });
-    const prefix = result.errors?.length ? `Codex reported errors:\n${result.errors.join("\n")}\n\n` : "";
-    await telegram.sendMessage(chatId, `${prefix}${result.text || "(Codex completed without final text.)"}`);
-  } catch (error) {
-    log("error", "codex turn failed", { chatId, error: error.message });
-    await telegram.sendMessage(chatId, `Codex 执行失败：${error.message}`);
-  }
+  const ack = telegram.sendMessage(chatId, "收到，已加入队列转给 Codex。");
+  telegram.sendChatAction(chatId).catch(() => {});
+  queue.enqueue(chatKey, async () => {
+    try {
+      await ack;
+      await telegram.sendChatAction(chatId);
+      const result = await codex.sendTurn({
+        threadId: binding.threadId,
+        text,
+        cwd: binding.cwd || config.codex.defaultCwd,
+        model: binding.model || config.codex.defaultModel,
+      });
+      const prefix = result.errors?.length ? `Codex reported errors:\n${result.errors.join("\n")}\n\n` : "";
+      await telegram.sendMessage(chatId, `${prefix}${result.text || "(Codex completed without final text.)"}`);
+    } catch (error) {
+      log("error", "codex turn failed", { chatId, error: error.message });
+      await telegram.sendMessage(chatId, `Codex 执行失败：${error.message}`);
+    }
+  }).catch((error) => {
+    log("error", "queued telegram message failed", { chatId, error: error.message });
+  });
 }
 
 async function startTelegramPolling(context) {
@@ -526,8 +573,7 @@ async function startTelegramPolling(context) {
         offset = update.update_id + 1;
         await store.setTelegramOffset(offset);
         if (update.message) {
-          const chatKey = `telegram:${update.message.chat.id}`;
-          context.queue.enqueue(chatKey, () => handleTelegramMessage({ ...context, message: update.message })).catch((error) => {
+          handleTelegramMessage({ ...context, message: update.message }).catch((error) => {
             log("error", "telegram message handler failed", { error: error.message });
           });
         }

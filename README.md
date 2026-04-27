@@ -50,6 +50,7 @@ curl -X POST http://127.0.0.1:8088/api/bind \
 ```
 
 After binding, normal Telegram messages sent to the bot become user turns in that Codex thread.
+Messages from the same Telegram chat are queued in order. If the target Codex thread is still active, the bridge waits for it to become idle before starting the next turn.
 
 ## Notify a channel
 
