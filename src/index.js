@@ -68,6 +68,7 @@ async function loadConfig(configPath) {
       url: process.env.CODEX_REMOTE_URL || "ws://127.0.0.1:17374",
       defaultCwd: process.env.CODEX_DEFAULT_CWD || process.cwd(),
       defaultModel: process.env.CODEX_MODEL || null,
+      approvalsReviewer: process.env.CODEX_APPROVALS_REVIEWER || "auto_review",
       ...(fileConfig.codex || {}),
     },
     telegram: {
@@ -201,8 +202,10 @@ function splitTelegram(text) {
 }
 
 class CodexClient {
-  constructor(url) {
+  constructor(url, options = {}) {
     this.url = url;
+    this.approvalsReviewer = options.approvalsReviewer || null;
+    this.approvalFallback = options.approvalFallback || "decline";
     this.ws = null;
     this.nextId = 1;
     this.pending = new Map();
@@ -243,6 +246,10 @@ class CodexClient {
       else resolve(msg.result);
       return;
     }
+    if (msg.id && msg.method) {
+      this.handleServerRequest(msg);
+      return;
+    }
 
     const params = msg.params || {};
     const turnId = params.turnId || params.turn?.id;
@@ -266,6 +273,7 @@ class CodexClient {
     } else if (msg.method === "turn/completed") {
       clearTimeout(turn.timer);
       this.turns.delete(key);
+      log("info", "codex turn completed", { threadId: params.threadId, turnId });
       turn.resolve({
         text: (turn.finalText || turn.text).trim(),
         errors: turn.errors,
@@ -287,6 +295,39 @@ class CodexClient {
     });
   }
 
+  respond(id, result) {
+    this.ws.send(JSON.stringify({ jsonrpc: "2.0", id, result }));
+  }
+
+  handleServerRequest(msg) {
+    const method = msg.method;
+    log("warn", "codex server request handled by bridge fallback", { method });
+    if (method === "item/commandExecution/requestApproval") {
+      this.respond(msg.id, { decision: this.approvalFallback === "accept" ? "accept" : "decline" });
+    } else if (method === "item/fileChange/requestApproval") {
+      this.respond(msg.id, { decision: this.approvalFallback === "accept" ? "accept" : "decline" });
+    } else if (method === "execCommandApproval" || method === "applyPatchApproval") {
+      this.respond(msg.id, { decision: this.approvalFallback === "accept" ? "approved" : "denied" });
+    } else if (method === "item/permissions/requestApproval") {
+      this.respond(msg.id, { permissions: {}, scope: "turn", strictAutoReview: true });
+    } else if (method === "item/tool/requestUserInput") {
+      this.respond(msg.id, { answers: {} });
+    } else if (method === "mcpServer/elicitation/request") {
+      this.respond(msg.id, { action: "cancel", content: null, _meta: null });
+    } else if (method === "item/tool/call") {
+      this.respond(msg.id, {
+        success: false,
+        contentItems: [{ type: "inputText", text: `Bridge cannot execute dynamic tool request: ${msg.params?.tool || "unknown"}` }],
+      });
+    } else {
+      this.ws.send(JSON.stringify({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32601, message: `Bridge does not implement server request: ${method}` },
+      }));
+    }
+  }
+
   async listThreads(limit = 20) {
     await this.connect();
     return this.request("thread/list", { limit, sourceKinds: [] });
@@ -297,6 +338,7 @@ class CodexClient {
     const result = await this.request("thread/start", {
       cwd,
       model: model || null,
+      approvalsReviewer: this.approvalsReviewer,
       ephemeral: false,
       experimentalRawEvents: false,
       persistExtendedHistory: true,
@@ -313,6 +355,7 @@ class CodexClient {
       threadId,
       cwd: cwd || null,
       model: model || null,
+      approvalsReviewer: this.approvalsReviewer,
       persistExtendedHistory: true,
     });
     this.loadedThreads.add(threadId);
@@ -361,24 +404,78 @@ class CodexClient {
     for (const waiter of waiters) waiter();
   }
 
-  async sendTurn({ threadId, text, cwd, model, timeoutMs = 30 * 60 * 1000 }) {
-    await this.waitForIdle(threadId, timeoutMs);
+  latestActiveTurn(thread) {
+    return (thread.turns || [])
+      .filter((turn) => turn.status === "inProgress")
+      .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0))[0] || null;
+  }
+
+  watchTurn(threadId, turnId, timeoutMs) {
+    const key = `${threadId}:${turnId}`;
+    if (this.turns.has(key)) return this.turns.get(key).promise;
+    let resolve;
+    let reject;
+    const promise = new Promise((promiseResolve, promiseReject) => {
+      resolve = promiseResolve;
+      reject = promiseReject;
+    });
+    const timer = setTimeout(() => {
+      this.turns.delete(key);
+      reject(new Error(`Codex turn timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
+    this.turns.set(key, { text: "", finalText: "", errors: [], resolve, reject, timer, promise });
+    return promise;
+  }
+
+  async startTurn({ threadId, text, cwd, model, timeoutMs }) {
     await this.resumeThread(threadId, { cwd, model });
     const started = await this.request("turn/start", {
       threadId,
       model: model || null,
       cwd: cwd || null,
+      approvalsReviewer: this.approvalsReviewer,
       input: [{ type: "text", text, text_elements: [] }],
     });
     const turnId = started.turn.id;
-    const key = `${threadId}:${turnId}`;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+    log("info", "codex turn started", { threadId, turnId });
+    return this.watchTurn(threadId, turnId, timeoutMs);
+  }
+
+  async steerTurn({ threadId, turnId, text, timeoutMs }) {
+    const result = this.watchTurn(threadId, turnId, timeoutMs);
+    try {
+      await this.request("turn/steer", {
+        threadId,
+        expectedTurnId: turnId,
+        input: [{ type: "text", text, text_elements: [] }],
+      });
+      log("info", "codex active turn steered", { threadId, turnId });
+    } catch (error) {
+      const key = `${threadId}:${turnId}`;
+      const turn = this.turns.get(key);
+      if (turn) {
+        clearTimeout(turn.timer);
         this.turns.delete(key);
-        reject(new Error(`Codex turn timed out after ${Math.round(timeoutMs / 1000)}s`));
-      }, timeoutMs);
-      this.turns.set(key, { text: "", finalText: "", errors: [], resolve, reject, timer });
-    });
+      }
+      throw error;
+    }
+    return result;
+  }
+
+  async sendTurn({ threadId, text, cwd, model, timeoutMs = 30 * 60 * 1000 }) {
+    await this.resumeThread(threadId, { cwd, model });
+    const thread = await this.readThread(threadId, true);
+    const activeTurn = this.latestActiveTurn(thread);
+    if (thread.status?.type === "active" && activeTurn) {
+      const flags = thread.status.activeFlags?.length ? thread.status.activeFlags.join(", ") : "active";
+      log("info", "codex thread active; steering existing turn", { threadId, turnId: activeTurn.id, flags });
+      return this.steerTurn({ threadId, turnId: activeTurn.id, text, timeoutMs });
+    }
+    if (thread.status?.type === "active") {
+      log("info", "codex thread active without readable active turn; waiting for idle", { threadId });
+      await this.waitForIdle(threadId, timeoutMs);
+    }
+    return this.startTurn({ threadId, text, cwd, model, timeoutMs });
   }
 }
 
@@ -541,7 +638,8 @@ async function handleTelegramMessage({ telegram, codex, store, config, queue, me
 
   const ack = telegram.sendMessage(chatId, "收到，已加入队列转给 Codex。");
   telegram.sendChatAction(chatId).catch(() => {});
-  queue.enqueue(chatKey, async () => {
+  log("info", "telegram message queued for codex", { chatId, threadId: binding.threadId });
+  const job = queue.enqueue(chatKey, async () => {
     try {
       await ack;
       await telegram.sendChatAction(chatId);
@@ -553,6 +651,7 @@ async function handleTelegramMessage({ telegram, codex, store, config, queue, me
       });
       const prefix = result.errors?.length ? `Codex reported errors:\n${result.errors.join("\n")}\n\n` : "";
       await telegram.sendMessage(chatId, `${prefix}${result.text || "(Codex completed without final text.)"}`);
+      log("info", "telegram codex response sent", { chatId, threadId: binding.threadId, turnId: result.turnId });
     } catch (error) {
       log("error", "codex turn failed", { chatId, error: error.message });
       await telegram.sendMessage(chatId, `Codex 执行失败：${error.message}`);
@@ -560,6 +659,7 @@ async function handleTelegramMessage({ telegram, codex, store, config, queue, me
   }).catch((error) => {
     log("error", "queued telegram message failed", { chatId, error: error.message });
   });
+  return job;
 }
 
 async function startTelegramPolling(context) {
@@ -622,6 +722,16 @@ async function createServer(context) {
         const text = body.text || [body.title, body.summary, Array.isArray(body.details) ? body.details.join("\n") : body.details].filter(Boolean).join("\n\n");
         await telegram.sendMessage(target.chatId, text || "(empty notification)");
         sendJson(res, 200, { ok: true });
+      } else if (req.method === "POST" && url.pathname === "/api/send") {
+        if (!requireAdmin(req, config)) return sendJson(res, 403, { error: "forbidden" });
+        const body = await readBody(req);
+        const chatId = String(body.chatId || config.channels.default?.chatId || "");
+        if (!chatId) return sendJson(res, 400, { error: "chatId is required" });
+        const text = String(body.text || "").trim();
+        if (!text) return sendJson(res, 400, { error: "text is required" });
+        const job = handleTelegramMessage({ ...context, message: { chat: { id: chatId }, text } });
+        if (body.wait) await job;
+        sendJson(res, 200, { ok: true });
       } else if (req.method === "GET" && url.pathname === "/api/threads") {
         if (!requireAdmin(req, config)) return sendJson(res, 403, { error: "forbidden" });
         sendJson(res, 200, await codex.listThreads(20));
@@ -643,7 +753,10 @@ async function main() {
   const config = await loadConfig(configPath);
   const token = process.env[config.telegram.botTokenEnv] || process.env.TELEGRAM_BOT_TOKEN;
   const telegram = new Telegram(token);
-  const codex = new CodexClient(config.codex.url);
+  const codex = new CodexClient(config.codex.url, {
+    approvalsReviewer: config.codex.approvalsReviewer,
+    approvalFallback: process.env.CODEX_BRIDGE_APPROVAL_FALLBACK || "decline",
+  });
   const store = new Store(statePath);
   const queue = new ChatQueue();
   await store.load();

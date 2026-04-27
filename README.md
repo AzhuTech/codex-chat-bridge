@@ -24,6 +24,7 @@ Create `config/config.json` from `config/config.example.json`, or use environmen
 export TELEGRAM_BOT_TOKEN=...
 export BRIDGE_ADMIN_TOKEN=$(openssl rand -hex 24)
 export CODEX_REMOTE_URL=ws://127.0.0.1:17374
+export CODEX_APPROVALS_REVIEWER=auto_review
 ```
 
 ## Start bridge locally
@@ -49,8 +50,8 @@ curl -X POST http://127.0.0.1:8088/api/bind \
   -d '{"transport":"telegram","chatId":"1038609497","threadId":"019d...","name":"main"}'
 ```
 
-After binding, normal Telegram messages sent to the bot become user turns in that Codex thread.
-Messages from the same Telegram chat are queued in order. If the target Codex thread is still active, the bridge waits for it to become idle before starting the next turn.
+After binding, normal Telegram messages sent to the bot are delivered to that Codex thread.
+Messages from the same Telegram chat are queued in order. If the thread is idle, the bridge starts a new turn; if the thread already has an active turn, it uses Codex app-server `turn/steer` so Telegram input is delivered to the active session instead of waiting forever.
 
 ## Notify a channel
 
