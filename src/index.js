@@ -7,6 +7,7 @@ import path from "node:path";
 const ROOT = process.cwd();
 const DEFAULT_CONFIG_PATH = path.join(ROOT, "config", "config.json");
 const DEFAULT_STATE_PATH = path.join(ROOT, "data", "state.json");
+const VALID_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
 
 function log(level, message, meta = {}) {
   const safe = JSON.stringify(meta, (_, value) => {
@@ -68,6 +69,7 @@ async function loadConfig(configPath) {
       url: process.env.CODEX_REMOTE_URL || "ws://127.0.0.1:17374",
       defaultCwd: process.env.CODEX_DEFAULT_CWD || process.cwd(),
       defaultModel: process.env.CODEX_MODEL || null,
+      defaultEffort: process.env.CODEX_REASONING_EFFORT || null,
       approvalsReviewer: process.env.CODEX_APPROVALS_REVIEWER || "auto_review",
       ...(fileConfig.codex || {}),
     },
@@ -86,6 +88,9 @@ async function loadConfig(configPath) {
   config.server.host = process.env.BRIDGE_HOST || config.server.host;
   config.server.port = Number(process.env.BRIDGE_PORT || config.server.port);
   config.codex.url = process.env.CODEX_REMOTE_URL || config.codex.url;
+  if (config.codex.defaultEffort && !VALID_REASONING_EFFORTS.includes(config.codex.defaultEffort)) {
+    throw new Error(`Invalid codex.defaultEffort: ${config.codex.defaultEffort}`);
+  }
   if (process.env.TELEGRAM_CHAT_ID) {
     if (!config.channels.default?.chatId) {
       config.channels.default = { transport: "telegram", chatId: process.env.TELEGRAM_CHAT_ID };
@@ -333,6 +338,11 @@ class CodexClient {
     return this.request("thread/list", { limit, sourceKinds: [] });
   }
 
+  async listModels(limit = 50) {
+    await this.connect();
+    return this.request("model/list", { limit, includeHidden: false });
+  }
+
   async startThread({ cwd, model }) {
     await this.connect();
     const result = await this.request("thread/start", {
@@ -427,11 +437,12 @@ class CodexClient {
     return promise;
   }
 
-  async startTurn({ threadId, text, cwd, model, timeoutMs }) {
+  async startTurn({ threadId, text, cwd, model, effort, timeoutMs }) {
     await this.resumeThread(threadId, { cwd, model });
     const started = await this.request("turn/start", {
       threadId,
       model: model || null,
+      effort: effort || null,
       cwd: cwd || null,
       approvalsReviewer: this.approvalsReviewer,
       input: [{ type: "text", text, text_elements: [] }],
@@ -462,7 +473,7 @@ class CodexClient {
     return result;
   }
 
-  async sendTurn({ threadId, text, cwd, model, timeoutMs = 30 * 60 * 1000 }) {
+  async sendTurn({ threadId, text, cwd, model, effort, timeoutMs = 30 * 60 * 1000 }) {
     await this.resumeThread(threadId, { cwd, model });
     const thread = await this.readThread(threadId, true);
     const activeTurn = this.latestActiveTurn(thread);
@@ -475,7 +486,7 @@ class CodexClient {
       log("info", "codex thread active without readable active turn; waiting for idle", { threadId });
       await this.waitForIdle(threadId, timeoutMs);
     }
-    return this.startTurn({ threadId, text, cwd, model, timeoutMs });
+    return this.startTurn({ threadId, text, cwd, model, effort, timeoutMs });
   }
 }
 
@@ -542,6 +553,9 @@ function renderSetup(config, store) {
     <label>Telegram chat id</label><input name="chatId" />
     <label>Codex thread id</label><input name="threadId" />
     <label>Name</label><input name="name" value="main" />
+    <label>Working directory</label><input name="cwd" value="${escapeHtml(config.codex.defaultCwd || "")}" />
+    <label>Model</label><input name="model" value="${escapeHtml(config.codex.defaultModel || "")}" />
+    <label>Thinking depth</label><input name="effort" value="${escapeHtml(config.codex.defaultEffort || "")}" />
     <button type="submit">Bind</button>
   </form>
 </body>
@@ -564,8 +578,9 @@ async function handleSetupBind(req, res, config, store) {
     chatId: form.get("chatId"),
     threadId: form.get("threadId"),
     name: form.get("name") || "main",
-    cwd: config.codex.defaultCwd,
-    model: config.codex.defaultModel,
+    cwd: form.get("cwd") || config.codex.defaultCwd,
+    model: form.get("model") || config.codex.defaultModel,
+    effort: form.get("effort") || config.codex.defaultEffort,
   });
   res.writeHead(303, { location: "/" });
   res.end();
@@ -600,40 +615,127 @@ async function withTyping(telegram, chatId, task) {
   }
 }
 
-async function handleTelegramMessage({ telegram, codex, store, config, queue, message }) {
-  const chatId = String(message.chat.id);
-  const chatKey = `telegram:${chatId}`;
-  const text = (message.text || "").trim();
-  if (!text) return;
+function parseTelegramCommand(text) {
+  const match = text.match(/^\/([A-Za-z0-9_]+)(?:@\S+)?(?:\s+([\s\S]*))?$/);
+  if (!match) return null;
+  return { name: match[1].toLowerCase(), args: (match[2] || "").trim() };
+}
 
-  if (text === "/start" || text === "/help") {
-    const binding = store.getBinding("telegram", chatId);
+function effectiveCwd(binding, config) {
+  return binding?.cwd || config.codex.defaultCwd;
+}
+
+function effectiveModel(binding, config) {
+  return binding?.model || config.codex.defaultModel || null;
+}
+
+function effectiveEffort(binding, config) {
+  return binding?.effort || config.codex.defaultEffort || null;
+}
+
+function resetArg(value) {
+  return ["default", "reset", "inherit", "-"].includes(value.toLowerCase());
+}
+
+function formatThreadStatus(status) {
+  if (!status?.type) return "unknown";
+  const flags = status.activeFlags?.length ? ` (${status.activeFlags.join(", ")})` : "";
+  return `${status.type}${flags}`;
+}
+
+function formatStatus({ chatId, binding, config, thread, threadError }) {
+  if (!binding) return `Chat: telegram:${chatId}\nBinding: none`;
+  const lines = [
+    `Chat: telegram:${chatId}`,
+    `Binding: ${binding.name || "main"}`,
+    `Thread: ${binding.threadId}`,
+    `Cwd: ${effectiveCwd(binding, config)}`,
+    `Model: ${effectiveModel(binding, config) || "(Codex default)"}`,
+    `Thinking: ${effectiveEffort(binding, config) || "(Codex default)"}`,
+    `Updated: ${binding.updatedAt || "unknown"}`,
+  ];
+  if (thread) {
+    lines.push(`Codex status: ${formatThreadStatus(thread.status)}`);
+    if (thread.name) lines.push(`Codex title: ${thread.name}`);
+  } else if (threadError) {
+    lines.push(`Codex status: unavailable (${threadError})`);
+  }
+  return lines.join("\n");
+}
+
+function renderModels(models, limit = 30) {
+  if (!models.length) return "No models returned by Codex.";
+  const lines = ["Available models:"];
+  for (const model of models.slice(0, limit)) {
+    const efforts = model.supportedReasoningEfforts?.map((item) => item.reasoningEffort).join(", ") || "unknown";
+    const marker = model.isDefault ? " [default]" : "";
+    lines.push(`- ${model.model || model.id}${marker}: thinking ${efforts}`);
+  }
+  if (models.length > limit) lines.push(`... ${models.length - limit} more omitted`);
+  return lines.join("\n");
+}
+
+async function getModelsByName(codex) {
+  const response = await codex.listModels(100);
+  const models = response.data || [];
+  const byName = new Map();
+  for (const model of models) {
+    if (model.model) byName.set(model.model, model);
+    if (model.id) byName.set(model.id, model);
+  }
+  return { models, byName };
+}
+
+function missingBindingMessage() {
+  return "No Codex thread is bound to this chat. Send /new or bind a thread from setup.";
+}
+
+async function handleTelegramCommand({ telegram, codex, store, config, chatId, command }) {
+  let binding = store.getBinding("telegram", chatId);
+
+  if (command.name === "start" || command.name === "help") {
     await telegram.sendMessage(chatId, [
       "codex-chat-bridge is online.",
       binding ? `Bound thread: ${binding.threadId}` : "This chat is not bound yet.",
       "",
       "Commands:",
-      "/status - show binding",
-      "/new - create a new Codex thread",
-      "If the bound Codex thread is busy, messages from this chat are queued in order.",
-      "Any other message is sent to the bound Codex thread.",
+      "/status - show session status",
+      "/new - create and bind a new Codex thread",
+      "/model - show current model",
+      "/model <model> - set model for future turns",
+      "/models - list available models",
+      "/thinking - show current thinking depth",
+      "/thinking <none|minimal|low|medium|high|xhigh> - set thinking depth",
+      "/effort <none|minimal|low|medium|high|xhigh> - alias for /thinking",
+      "/cwd - show bound working directory",
+      "/cwd <absolute-path> - set working directory for future turns",
+      "",
+      "Normal messages are sent to the bound Codex thread.",
     ].join("\n"));
-    return;
+    return true;
   }
 
-  if (text === "/status") {
-    const binding = store.getBinding("telegram", chatId);
-    await telegram.sendMessage(chatId, binding ? JSON.stringify(binding, null, 2) : "No binding for this chat.");
-    return;
+  if (command.name === "status") {
+    let thread = null;
+    let threadError = null;
+    if (binding) {
+      await telegram.sendChatAction(chatId);
+      try {
+        thread = await codex.readThread(binding.threadId, false);
+      } catch (error) {
+        threadError = error.message;
+      }
+    }
+    await telegram.sendMessage(chatId, formatStatus({ chatId, binding, config, thread, threadError }));
+    return true;
   }
 
   if (!chatAllowed(config, store, chatId)) {
     await telegram.sendMessage(chatId, "This chat is not authorized. Bind it from the setup page or admin API first.");
-    return;
+    return true;
   }
 
-  let binding = store.getBinding("telegram", chatId);
-  if (text === "/new") {
+  if (command.name === "new") {
     await telegram.sendChatAction(chatId);
     const thread = await codex.startThread({ cwd: config.codex.defaultCwd, model: config.codex.defaultModel });
     binding = await store.setBinding({
@@ -643,13 +745,126 @@ async function handleTelegramMessage({ telegram, codex, store, config, queue, me
       name: thread.name || "telegram",
       cwd: config.codex.defaultCwd,
       model: config.codex.defaultModel,
+      effort: config.codex.defaultEffort,
     });
-    await telegram.sendMessage(chatId, `Created and bound new Codex thread:\n${binding.threadId}`);
+    await telegram.sendMessage(chatId, [
+      "Created and bound new Codex thread:",
+      binding.threadId,
+      `Model: ${effectiveModel(binding, config) || "(Codex default)"}`,
+      `Thinking: ${effectiveEffort(binding, config) || "(Codex default)"}`,
+      `Cwd: ${effectiveCwd(binding, config)}`,
+    ].join("\n"));
+    return true;
+  }
+
+  if (command.name === "models") {
+    await telegram.sendChatAction(chatId);
+    try {
+      const { models } = await getModelsByName(codex);
+      await telegram.sendMessage(chatId, renderModels(models));
+    } catch (error) {
+      await telegram.sendMessage(chatId, `Could not list models: ${error.message}`);
+    }
+    return true;
+  }
+
+  if (!binding && ["model", "thinking", "effort", "cwd", "pwd"].includes(command.name)) {
+    await telegram.sendMessage(chatId, missingBindingMessage());
+    return true;
+  }
+
+  if (command.name === "model") {
+    if (!command.args) {
+      await telegram.sendMessage(chatId, [
+        `Current model: ${effectiveModel(binding, config) || "(Codex default)"}`,
+        "Set with /model <model>. Reset with /model default.",
+      ].join("\n"));
+      return true;
+    }
+    if (resetArg(command.args)) {
+      binding = await store.setBinding({ ...binding, model: null });
+      await telegram.sendMessage(chatId, `Model reset. Effective model: ${effectiveModel(binding, config) || "(Codex default)"}`);
+      return true;
+    }
+    const requested = command.args.split(/\s+/)[0];
+    try {
+      const { models, byName } = await getModelsByName(codex);
+      if (!byName.has(requested)) {
+        await telegram.sendMessage(chatId, [
+          `Unknown model: ${requested}`,
+          "",
+          renderModels(models, 20),
+        ].join("\n"));
+        return true;
+      }
+    } catch (error) {
+      log("warn", "model validation skipped", { error: error.message });
+    }
+    binding = await store.setBinding({ ...binding, model: requested });
+    await telegram.sendMessage(chatId, `Model set to ${requested}. Future new turns will use it.`);
+    return true;
+  }
+
+  if (command.name === "thinking" || command.name === "effort") {
+    if (!command.args) {
+      await telegram.sendMessage(chatId, [
+        `Current thinking: ${effectiveEffort(binding, config) || "(Codex default)"}`,
+        `Allowed values: ${VALID_REASONING_EFFORTS.join(", ")}`,
+        `Set with /${command.name} <value>. Reset with /${command.name} default.`,
+      ].join("\n"));
+      return true;
+    }
+    const requested = command.args.split(/\s+/)[0].toLowerCase();
+    if (resetArg(requested)) {
+      binding = await store.setBinding({ ...binding, effort: null });
+      await telegram.sendMessage(chatId, `Thinking reset. Effective thinking: ${effectiveEffort(binding, config) || "(Codex default)"}`);
+      return true;
+    }
+    if (!VALID_REASONING_EFFORTS.includes(requested)) {
+      await telegram.sendMessage(chatId, `Unsupported thinking depth: ${requested}\nAllowed values: ${VALID_REASONING_EFFORTS.join(", ")}`);
+      return true;
+    }
+    binding = await store.setBinding({ ...binding, effort: requested });
+    await telegram.sendMessage(chatId, `Thinking set to ${requested}. Future new turns will use it.`);
+    return true;
+  }
+
+  if (command.name === "cwd" || command.name === "pwd") {
+    if (!command.args) {
+      await telegram.sendMessage(chatId, `Current cwd: ${effectiveCwd(binding, config)}`);
+      return true;
+    }
+    const requested = command.args.trim();
+    if (!path.isAbsolute(requested)) {
+      await telegram.sendMessage(chatId, "Cwd must be an absolute host path.");
+      return true;
+    }
+    binding = await store.setBinding({ ...binding, cwd: requested });
+    await telegram.sendMessage(chatId, `Cwd set to ${requested}. Future new turns will use it.`);
+    return true;
+  }
+
+  await telegram.sendMessage(chatId, `Unknown command: /${command.name}\nSend /help for available commands.`);
+  return true;
+}
+
+async function handleTelegramMessage({ telegram, codex, store, config, queue, message }) {
+  const chatId = String(message.chat.id);
+  const chatKey = `telegram:${chatId}`;
+  const text = (message.text || "").trim();
+  if (!text) return;
+
+  const command = parseTelegramCommand(text);
+  if (command && await handleTelegramCommand({ telegram, codex, store, config, chatId, command })) return;
+
+  if (!chatAllowed(config, store, chatId)) {
+    await telegram.sendMessage(chatId, "This chat is not authorized. Bind it from the setup page or admin API first.");
     return;
   }
 
+  let binding = store.getBinding("telegram", chatId);
   if (!binding) {
-    await telegram.sendMessage(chatId, "No Codex thread is bound to this chat. Send /new or bind a thread from setup.");
+    await telegram.sendMessage(chatId, missingBindingMessage());
     return;
   }
 
@@ -659,8 +874,9 @@ async function handleTelegramMessage({ telegram, codex, store, config, queue, me
       const result = await withTyping(telegram, chatId, () => codex.sendTurn({
         threadId: binding.threadId,
         text,
-        cwd: binding.cwd || config.codex.defaultCwd,
-        model: binding.model || config.codex.defaultModel,
+        cwd: effectiveCwd(binding, config),
+        model: effectiveModel(binding, config),
+        effort: effectiveEffort(binding, config),
       }));
       const prefix = result.errors?.length ? `Codex reported errors:\n${result.errors.join("\n")}\n\n` : "";
       await telegram.sendMessage(chatId, `${prefix}${result.text || "(Codex completed without final text.)"}`);
@@ -724,6 +940,7 @@ async function createServer(context) {
           name: body.name || "main",
           cwd: body.cwd || config.codex.defaultCwd,
           model: body.model || config.codex.defaultModel,
+          effort: body.effort || config.codex.defaultEffort,
         });
         sendJson(res, 200, { ok: true, binding });
       } else if (req.method === "POST" && url.pathname === "/api/notify") {

@@ -12,6 +12,7 @@ services:
       - CODEX_REMOTE_URL=ws://host.docker.internal:17374
       - CODEX_DEFAULT_CWD=/Users/azhu/Research.localized/AzhuTech
       - CODEX_MODEL=gpt-5.5
+      - CODEX_REASONING_EFFORT=medium
       - CODEX_APPROVALS_REVIEWER=auto_review
       - CODEX_BRIDGE_APPROVAL_FALLBACK=decline
     volumes:
