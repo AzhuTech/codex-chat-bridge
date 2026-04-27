@@ -1,0 +1,19 @@
+{
+  "name": "codex-chat-bridge",
+  "version": "0.1.0",
+  "description": "Relay chat messages to existing Codex app-server sessions.",
+  "type": "module",
+  "private": false,
+  "bin": {
+    "codex-chat-bridge": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "check": "node --check src/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}

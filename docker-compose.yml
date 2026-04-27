@@ -1,0 +1,15 @@
+services:
+  bridge:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - BRIDGE_ADMIN_TOKEN=${BRIDGE_ADMIN_TOKEN}
+      - CODEX_REMOTE_URL=ws://host.docker.internal:17374
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

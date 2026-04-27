@@ -1,0 +1,29 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8088
+  },
+  "codex": {
+    "url": "ws://127.0.0.1:17374",
+    "defaultCwd": "/Users/you/Research/AzhuTech",
+    "defaultModel": "gpt-5.5"
+  },
+  "telegram": {
+    "botTokenEnv": "TELEGRAM_BOT_TOKEN",
+    "pollIntervalMs": 1200
+  },
+  "security": {
+    "adminTokenEnv": "BRIDGE_ADMIN_TOKEN",
+    "allowedChatIds": []
+  },
+  "channels": {
+    "default": {
+      "transport": "telegram",
+      "chatId": ""
+    },
+    "automation": {
+      "transport": "telegram",
+      "chatId": ""
+    }
+  }
+}
