@@ -84,8 +84,12 @@ async function loadConfig(configPath) {
   };
   config.codex.url = process.env.CODEX_REMOTE_URL || config.codex.url;
   if (process.env.TELEGRAM_CHAT_ID) {
-    config.channels.default ||= { transport: "telegram", chatId: process.env.TELEGRAM_CHAT_ID };
-    config.channels.automation ||= { transport: "telegram", chatId: process.env.TELEGRAM_CHAT_ID };
+    if (!config.channels.default?.chatId) {
+      config.channels.default = { transport: "telegram", chatId: process.env.TELEGRAM_CHAT_ID };
+    }
+    if (!config.channels.automation?.chatId) {
+      config.channels.automation = { transport: "telegram", chatId: process.env.TELEGRAM_CHAT_ID };
+    }
   }
   return config;
 }
@@ -221,7 +225,7 @@ class CodexClient {
     });
     await this.request("initialize", {
       clientInfo: { name: "codex-chat-bridge", version: "0.1.0" },
-      capabilities: null,
+      capabilities: { experimentalApi: true },
     });
   }
 
