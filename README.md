@@ -53,6 +53,12 @@ curl -X POST http://127.0.0.1:8088/api/bind \
 After binding, normal Telegram messages sent to the bot are delivered to that Codex thread.
 Messages from the same Telegram chat are queued in order. If the thread is idle, the bridge starts a new turn; if the thread already has an active turn, it uses Codex app-server `turn/steer` so Telegram input is delivered to the active session instead of waiting forever.
 
+While a Telegram message is being processed, the bot uses Telegram's `typing` chat action instead of sending an acknowledgement message for every input. The chat receives only the final Codex response or an error.
+
+## Codex Desktop Visibility
+
+The bridge writes to the Codex app-server thread/session data. Codex Desktop may not live-refresh turns that were added externally through app-server. If a Telegram-delivered message does not appear immediately in the open Desktop window, restart Codex Desktop or reopen the thread; the persisted conversation should then include the bridge-delivered user and assistant turns.
+
 ## Notify a channel
 
 ```bash

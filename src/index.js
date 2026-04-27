@@ -583,6 +583,23 @@ function chatAllowed(config, store, chatId) {
   return Boolean(store.getBinding("telegram", String(chatId)));
 }
 
+async function withTyping(telegram, chatId, task) {
+  let stopped = false;
+  const tick = async () => {
+    while (!stopped) {
+      await telegram.sendChatAction(chatId).catch(() => {});
+      await sleep(4000);
+    }
+  };
+  const indicator = tick();
+  try {
+    return await task();
+  } finally {
+    stopped = true;
+    await indicator.catch(() => {});
+  }
+}
+
 async function handleTelegramMessage({ telegram, codex, store, config, queue, message }) {
   const chatId = String(message.chat.id);
   const chatKey = `telegram:${chatId}`;
@@ -636,19 +653,15 @@ async function handleTelegramMessage({ telegram, codex, store, config, queue, me
     return;
   }
 
-  const ack = telegram.sendMessage(chatId, "收到，已加入队列转给 Codex。");
-  telegram.sendChatAction(chatId).catch(() => {});
   log("info", "telegram message queued for codex", { chatId, threadId: binding.threadId });
   const job = queue.enqueue(chatKey, async () => {
     try {
-      await ack;
-      await telegram.sendChatAction(chatId);
-      const result = await codex.sendTurn({
+      const result = await withTyping(telegram, chatId, () => codex.sendTurn({
         threadId: binding.threadId,
         text,
         cwd: binding.cwd || config.codex.defaultCwd,
         model: binding.model || config.codex.defaultModel,
-      });
+      }));
       const prefix = result.errors?.length ? `Codex reported errors:\n${result.errors.join("\n")}\n\n` : "";
       await telegram.sendMessage(chatId, `${prefix}${result.text || "(Codex completed without final text.)"}`);
       log("info", "telegram codex response sent", { chatId, threadId: binding.threadId, turnId: result.turnId });
