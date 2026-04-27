@@ -82,6 +82,8 @@ async function loadConfig(configPath) {
     },
     channels: { ...(fileConfig.channels || {}) },
   };
+  config.server.host = process.env.BRIDGE_HOST || config.server.host;
+  config.server.port = Number(process.env.BRIDGE_PORT || config.server.port);
   config.codex.url = process.env.CODEX_REMOTE_URL || config.codex.url;
   if (process.env.TELEGRAM_CHAT_ID) {
     if (!config.channels.default?.chatId) {
@@ -248,13 +250,17 @@ class CodexClient {
 
     if (msg.method === "item/agentMessage/delta") {
       turn.text += params.delta || "";
+    } else if (msg.method === "item/completed" && params.item?.type === "agentMessage") {
+      if (params.item.phase === "final" || !turn.finalText) {
+        turn.finalText = params.item.text || "";
+      }
     } else if (msg.method === "error") {
       turn.errors.push(params.error?.message || JSON.stringify(params));
     } else if (msg.method === "turn/completed") {
       clearTimeout(turn.timer);
       this.turns.delete(key);
       turn.resolve({
-        text: turn.text.trim(),
+        text: (turn.finalText || turn.text).trim(),
         errors: turn.errors,
         threadId: params.threadId,
         turnId,
@@ -320,8 +326,23 @@ class CodexClient {
         this.turns.delete(key);
         reject(new Error(`Codex turn timed out after ${Math.round(timeoutMs / 1000)}s`));
       }, timeoutMs);
-      this.turns.set(key, { text: "", errors: [], resolve, reject, timer });
+      this.turns.set(key, { text: "", finalText: "", errors: [], resolve, reject, timer });
     });
+  }
+}
+
+class ChatQueue {
+  constructor() {
+    this.queues = new Map();
+  }
+
+  enqueue(key, task) {
+    const previous = this.queues.get(key) || Promise.resolve();
+    const next = previous.catch(() => {}).then(task);
+    this.queues.set(key, next.finally(() => {
+      if (this.queues.get(key) === next) this.queues.delete(key);
+    }));
+    return next;
   }
 }
 
@@ -493,7 +514,8 @@ async function startTelegramPolling(context) {
         offset = update.update_id + 1;
         await store.setTelegramOffset(offset);
         if (update.message) {
-          handleTelegramMessage({ ...context, message: update.message }).catch((error) => {
+          const chatKey = `telegram:${update.message.chat.id}`;
+          context.queue.enqueue(chatKey, () => handleTelegramMessage({ ...context, message: update.message })).catch((error) => {
             log("error", "telegram message handler failed", { error: error.message });
           });
         }
@@ -565,9 +587,10 @@ async function main() {
   const telegram = new Telegram(token);
   const codex = new CodexClient(config.codex.url);
   const store = new Store(statePath);
+  const queue = new ChatQueue();
   await store.load();
 
-  const context = { config, telegram, codex, store };
+  const context = { config, telegram, codex, store, queue };
   const server = await createServer(context);
   server.listen(config.server.port, config.server.host, () => {
     log("info", "bridge listening", { host: config.server.host, port: config.server.port, codexUrl: config.codex.url });
