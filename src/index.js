@@ -241,7 +241,8 @@ class CodexClient {
     }
 
     const params = msg.params || {};
-    const key = params.threadId && params.turnId ? `${params.threadId}:${params.turnId}` : null;
+    const turnId = params.turnId || params.turn?.id;
+    const key = params.threadId && turnId ? `${params.threadId}:${turnId}` : null;
     if (!key || !this.turns.has(key)) return;
     const turn = this.turns.get(key);
 
@@ -256,7 +257,7 @@ class CodexClient {
         text: turn.text.trim(),
         errors: turn.errors,
         threadId: params.threadId,
-        turnId: params.turn?.id || params.turnId,
+        turnId,
       });
     }
   }
